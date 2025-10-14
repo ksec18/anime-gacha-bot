@@ -1,0 +1,25 @@
+services:
+  - type: worker
+    name: anime-gacha-bot
+    env: node
+    plan: starter
+    autoDeploy: true
+    buildCommand: "npm ci"
+    startCommand: "npm start"
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: CLIENT_ID
+        sync: false
+      - key: GUILD_ID
+        sync: false
+      - key: DB_PATH
+        value: /data/gacha.sqlite
+
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
