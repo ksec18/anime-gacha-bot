@@ -1,0 +1,6 @@
+@"
+node_modules/
+.env
+data/
+gacha.sqlite
+"@ | Out-File -Encoding utf8 .gitignore
