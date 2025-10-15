@@ -1,4 +1,4 @@
-// bot.js (draft-only, 15 min cooldown)
+// bot.js (draft + /ygo + /pokemon, 15 min cooldown)
 import 'dotenv/config';
 import { Client, GatewayIntentBits, EmbedBuilder, Colors, PermissionFlagsBits, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
 import Database from 'better-sqlite3';
@@ -8,7 +8,6 @@ import { request } from 'undici';
    CONFIG
 ========================= */
 const COOLDOWN_SECONDS = 15 * 60; // 15 minutes
-const MAX_PULLS_ONCE = 10; // not used by draft, kept for future compatibility
 
 // Raretés : label, poids, couleur, pages AniList (popularité), badge
 const RARITIES = [
@@ -26,14 +25,14 @@ const PITY_MYTH_THRESHOLD = 100;  // garanti MYTH au plus tard
 const ANILIST_URL = 'https://graphql.anilist.co';
 const ANILIST_QUERY = `
 query ($page: Int, $perPage: Int) {
-  Page(page: $page, perPage: $perPage) {
+  Page(page: $$page, perPage: $$perPage) {
     characters(sort: FAVOURITES_DESC) {
       name { full }
       image { large }
       media(perPage: 1) { nodes { title { romaji english native } } }
     }
   }
-}`;
+}`.replaceAll('$$','');
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
@@ -101,7 +100,6 @@ const q = {
   // users
   getUserByDid: db.prepare('SELECT * FROM users WHERE did=?'),
   insertUser: db.prepare('INSERT INTO users(did, name) VALUES(?, ?)'),
-  updateUserName: db.prepare('UPDATE users SET name=? WHERE did=?'),
   updatePullTs: db.prepare('UPDATE users SET last_pull_ts=? WHERE id=?'),
   incStats: db.prepare('UPDATE users SET pulls=pulls+1, c=c+?, r=r+?, ep=ep+?, leg=leg+?, myth=myth+? WHERE id=?'),
   updatePityOnPull: db.prepare('UPDATE users SET pity_leg=?, pity_myth=? WHERE id=?'),
@@ -151,8 +149,6 @@ const q = {
 /* =========================
    HELPERS
 ========================= */
-function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
-
 function getOrCreateUser(member) {
   let u = q.getUserByDid.get(String(member.id));
   if (!u) {
@@ -206,20 +202,9 @@ function upsertCard(name, anime, image) {
   return info.lastInsertRowid;
 }
 
-function rarityEmbed(char, rarity, owner, stars=1, pityState='') {
-  const title = `${rarity.badge} ${rarity.k} • ${char.name} ${'⭐'.repeat(stars)}`;
-  const emb = new EmbedBuilder()
-    .setTitle(title)
-    .setDescription(`**Anime :** ${char.anime}`)
-    .setImage(char.image)
-    .setColor(rarity.color)
-    .setFooter({ text: pityState || `Gagné par ${owner.displayName ?? owner.user?.username}` });
-  return emb;
-}
-
 function snowflake() { return String(Date.now()) + Math.floor(Math.random()*1e6); }
 
-// Tire UNE carte candidate selon rareté + bannière (sans persister)
+/* ===== Draft helpers (anime all) ===== */
 async function rollOneCandidate(user, banner) {
   const rarity = rollRarityWithPity(user);
   let char = null;
@@ -237,6 +222,143 @@ async function rollOneCandidate(user, banner) {
   } while (attempts < 4);
 
   return char ? { rarity, char } : null;
+}
+
+/* ===== Yu-Gi-Oh! pool & rules ===== */
+const YGO_POOL = [
+  'Dark Magician','Blue-Eyes White Dragon','Red-Eyes Black Dragon','Summoned Skull',
+  'Jinzo','Buster Blader','Celtic Guardian','Gaia the Fierce Knight',
+  'Kuriboh','La Jinn the Mystical Genie','Beta The Magnet Warrior','Alpha The Magnet Warrior',
+  'Gamma The Magnet Warrior','Harpie Lady','Time Wizard','Relinquished',
+  'Obnoxious Celtic Guardian','Axe Raider','Vorcerader','Man-Eater Bug'
+];
+const YGO_STAT_RULES = {
+  C:   { hp:[1200,1800], dmg:[300,600] },
+  R:   { hp:[1800,2400], dmg:[600,1000] },
+  EP:  { hp:[2400,3000], dmg:[1000,1400] },
+  LEG: { hp:[3000,3800], dmg:[1400,1800] },
+  MYTH:{ hp:[3800,4500], dmg:[1800,2400] }
+};
+function randInt(min, max) { return Math.floor(Math.random()*(max-min+1))+min; }
+async function rollOneYGOCandidate(user) {
+  const rarity = rollRarityWithPity(user);
+  const name = YGO_POOL[Math.floor(Math.random()*YGO_POOL.length)];
+  const rules = YGO_STAT_RULES[rarity.k];
+  const hp = randInt(rules.hp[0], rules.hp[1]);
+  const dmg = randInt(rules.dmg[0], rules.dmg[1]);
+  return { rarity, char: { name, anime: 'Yu-Gi-Oh!', image: null }, stats: { hp, dmg } };
+}
+
+/* ===== Pokémon pool & rules ===== */
+// type: 'normal' | 'mega' | 'ex'
+// === Pokémon images (sprites officiels ou fanart) ===
+// Tu peux mettre les URL des images de ton choix (par ex. Imgur, PokéAPI, etc.)
+const POKEMON_IMAGES = {
+  'Pikachu': 'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/25.png',
+  'Charizard': 'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/6.png',
+  'Blastoise': 'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/9.png',
+  'Venusaur': 'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/3.png',
+  'Gengar': 'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/94.png',
+  'Lucario': 'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/448.png',
+  'Greninja': 'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/658.png',
+  'Dragonite': 'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/149.png',
+  'Tyranitar': 'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/248.png',
+  'Gardevoir': 'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/282.png',
+
+  // Méga-évolutions (ici exemples custom, car PokéAPI n’a pas de sprites Mega)
+  'Mega Charizard X': 'https://archives.bulbagarden.net/media/upload/0/05/006Charizard-Mega_X.png',
+  'Mega Charizard Y': 'https://archives.bulbagarden.net/media/upload/9/95/006Charizard-Mega_Y.png',
+  'Mega Blastoise': 'https://archives.bulbagarden.net/media/upload/0/02/009Blastoise-Mega.png',
+  'Mega Venusaur': 'https://archives.bulbagarden.net/media/upload/3/3d/003Venusaur-Mega.png',
+  'Mega Gengar': 'https://archives.bulbagarden.net/media/upload/e/e5/094Gengar-Mega.png',
+  'Mega Lucario': 'https://archives.bulbagarden.net/media/upload/4/41/448Lucario-Mega.png',
+  'Mega Gardevoir': 'https://archives.bulbagarden.net/media/upload/8/87/282Gardevoir-Mega.png',
+  'Mega Salamence': 'https://archives.bulbagarden.net/media/upload/0/0a/373Salamence-Mega.png',
+  'Mega Metagross': 'https://archives.bulbagarden.net/media/upload/5/5f/376Metagross-Mega.png',
+  'Mega Rayquaza': 'https://archives.bulbagarden.net/media/upload/8/8e/384Rayquaza-Mega.png',
+
+  // EX (cartes TCG — exemples)
+  'Mewtwo EX': 'https://images.pokemontcg.io/bw3/54_hires.png',
+  'Rayquaza EX': 'https://images.pokemontcg.io/xy6/60_hires.png',
+  'Groudon EX': 'https://images.pokemontcg.io/xy5/85_hires.png',
+  'Kyogre EX': 'https://images.pokemontcg.io/xy5/26_hires.png',
+  'Garchomp EX': 'https://images.pokemontcg.io/bw8/45_hires.png',
+  'Charizard EX': 'https://images.pokemontcg.io/xy2/12_hires.png'
+};
+
+const POKEMON_POOL = [
+  { name: 'Pikachu', type: 'normal' },
+  { name: 'Charizard', type: 'normal' },
+  { name: 'Blastoise', type: 'normal' },
+  { name: 'Venusaur', type: 'normal' },
+  { name: 'Gengar', type: 'normal' },
+  { name: 'Lucario', type: 'normal' },
+  { name: 'Greninja', type: 'normal' },
+  { name: 'Dragonite', type: 'normal' },
+  { name: 'Tyranitar', type: 'normal' },
+  { name: 'Gardevoir', type: 'normal' },
+
+  // Mega evolutions
+  { name: 'Mega Charizard X', type: 'mega' },
+  { name: 'Mega Charizard Y', type: 'mega' },
+  { name: 'Mega Blastoise', type: 'mega' },
+  { name: 'Mega Venusaur', type: 'mega' },
+  { name: 'Mega Gengar', type: 'mega' },
+  { name: 'Mega Lucario', type: 'mega' },
+  { name: 'Mega Gardevoir', type: 'mega' },
+  { name: 'Mega Salamence', type: 'mega' },
+  { name: 'Mega Metagross', type: 'mega' },
+  { name: 'Mega Rayquaza', type: 'mega' },
+
+  // EX (cartes type TCG style)
+  { name: 'Mewtwo EX', type: 'ex' },
+  { name: 'Rayquaza EX', type: 'ex' },
+  { name: 'Groudon EX', type: 'ex' },
+  { name: 'Kyogre EX', type: 'ex' },
+  { name: 'Garchomp EX', type: 'ex' },
+  { name: 'Charizard EX', type: 'ex' },
+];
+
+// Règles de stats par rareté, ajustées pour Pokémon
+const PKM_STAT_RULES = {
+  C:   { hp:[50,80],   dmg:[10,40] },
+  R:   { hp:[80,120],  dmg:[40,80] },
+  EP:  { hp:[120,180], dmg:[80,130] },
+  LEG: { hp:[180,230], dmg:[130,180] },
+  MYTH:{ hp:[230,300], dmg:[180,240] }
+};
+
+// Pondération des types par rareté (pour sortir des mega/ex surtout en hautes raretés)
+const TYPE_WEIGHT_BY_RARITY = {
+  C:   { normal: 1.0, mega: 0.0, ex: 0.0 },
+  R:   { normal: 0.95, mega: 0.04, ex: 0.01 },
+  EP:  { normal: 0.80, mega: 0.15, ex: 0.05 },
+  LEG: { normal: 0.40, mega: 0.40, ex: 0.20 },
+  MYTH:{ normal: 0.10, mega: 0.55, ex: 0.35 }
+};
+
+function weightedPick(weights) {
+  const x = Math.random();
+  let acc = 0;
+  for (const [k, w] of Object.entries(weights)) {
+    acc += w;
+    if (x <= acc) return k;
+  }
+  // fallback
+  return Object.keys(weights)[0];
+}
+
+async function rollOnePokemonCandidate(user) {
+  const rarity = rollRarityWithPity(user);
+  const type = weightedPick(TYPE_WEIGHT_BY_RARITY[rarity.k]);
+  const pool = POKEMON_POOL.filter(p => p.type === type);
+  const pick = pool[Math.floor(Math.random() * pool.length)];
+  const rules = PKM_STAT_RULES[rarity.k];
+  const hp = randInt(rules.hp[0], rules.hp[1]);
+  const dmg = randInt(rules.dmg[0], rules.dmg[1]);
+  const displayName = pick.name;
+const img = POKEMON_IMAGES[displayName] ?? null;
+return { rarity, char: { name: displayName, anime: 'Pokémon', image: img }, stats: { hp, dmg }, meta: { type } };
 }
 
 /* =========================
@@ -263,12 +385,12 @@ client.on('interactionCreate', async (i) => {
 });
 
 /* =========================
-   COMMANDES (DRAFT-ONLY)
+   COMMANDES
 ========================= */
 client.on('interactionCreate', async (i) => {
   if (!i.isChatInputCommand()) return;
 
-  // /draft : tire 3 cartes et laisse choisir 1 via boutons
+  // /draft : 3 cartes anime, choisir 1
   if (i.commandName === 'draft') {
     const user = getOrCreateUser(i.member);
     if (!canPull(user)) {
@@ -284,18 +406,13 @@ client.on('interactionCreate', async (i) => {
 
     await i.deferReply();
 
-    // Tire 3 candidats
     const candidates = [];
     for (let k=0;k<3;k++) {
       const cand = await rollOneCandidate(user, banner);
       if (cand) candidates.push(cand);
-      await new Promise(r=>setTimeout(r,120));
     }
-    if (candidates.length < 3) {
-      return i.editReply({ content: '❌ Impossible de générer 3 cartes (AniList indisponible). Réessaie.' });
-    }
+    if (candidates.length < 3) return i.editReply({ content: '❌ Impossible de générer 3 cartes (AniList indisponible). Réessaie.' });
 
-    // 3 embeds (non sauvegardés)
     const embeds = candidates.map((c, idx) => {
       const emb = new EmbedBuilder()
         .setTitle(`${c.rarity.badge} ${c.rarity.k} • ${c.char.name}`)
@@ -307,7 +424,6 @@ client.on('interactionCreate', async (i) => {
       return emb;
     });
 
-    // Boutons 1 / 2 / 3
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('choose_1').setLabel('1').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('choose_2').setLabel('2').setStyle(ButtonStyle.Primary),
@@ -316,7 +432,6 @@ client.on('interactionCreate', async (i) => {
 
     const sent = await i.editReply({ embeds, components: [row] });
 
-    // Attente du clic par l'auteur (60s)
     try {
       const click = await sent.awaitMessageComponent({
         filter: (btnInt) => btnInt.user.id === i.user.id && ['choose_1','choose_2','choose_3'].includes(btnInt.customId),
@@ -326,18 +441,15 @@ client.on('interactionCreate', async (i) => {
       const idx = Number(click.customId.split('_')[1]) - 1;
       const chosen = candidates[idx];
 
-      // Maintenant seulement on PERSISTE la carte choisie
       const cardId = upsertCard(chosen.char.name, chosen.char.anime, chosen.char.image);
       q.upsertOwnership.run(user.id, cardId);
 
-      // Mise à jour pity + stats pour la SEULE carte choisie
       updatePityCounters(user, chosen.rarity.k);
-      const pityFooter = `Pity LEG: ${user.pity_leg}/${PITY_LEG_THRESHOLD} • Pity MYTH: ${user.pity_myth}/${PITY_MYTH_THRESHOLD}`;
       const statsDelta = { C:0, R:0, EP:0, LEG:0, MYTH:0 };
       statsDelta[chosen.rarity.k] = 1;
       q.incStats.run(statsDelta.C, statsDelta.R, statsDelta.EP, statsDelta.LEG, statsDelta.MYTH, user.id);
+      const pityFooter = `Pity LEG: ${user.pity_leg}/${PITY_LEG_THRESHOLD} • Pity MYTH: ${user.pity_myth}/${PITY_MYTH_THRESHOLD}`;
 
-      // Affichage résultat + désactivation boutons
       const result = new EmbedBuilder()
         .setTitle(`✅ Tu as choisi: ${chosen.rarity.badge} ${chosen.rarity.k} • ${chosen.char.name}`)
         .setDescription(`**Anime :** ${chosen.char.anime}`)
@@ -353,14 +465,162 @@ client.on('interactionCreate', async (i) => {
 
       await click.update({ embeds: [result], components: [disabled] });
 
-    } catch (e) {
-      // Timeout: on retire les boutons
+    } catch {
       const disabled = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('choose_1').setLabel('1').setStyle(ButtonStyle.Secondary).setDisabled(true),
         new ButtonBuilder().setCustomId('choose_2').setLabel('2').setStyle(ButtonStyle.Secondary).setDisabled(true),
         new ButtonBuilder().setCustomId('choose_3').setLabel('3').setStyle(ButtonStyle.Secondary).setDisabled(true),
       );
       await i.editReply({ content: '⏰ Temps écoulé. Relance `/draft` pour recommencer.', components: [disabled] });
+    }
+  }
+
+  // /ygo : Yu-Gi-Oh!
+  else if (i.commandName === 'ygo') {
+    const user = getOrCreateUser(i.member);
+    if (!canPull(user)) {
+      const remaining = Math.ceil(COOLDOWN_SECONDS - (Date.now()/1000 - user.last_pull_ts));
+      const min = Math.max(0, Math.floor(remaining/60));
+      const sec = Math.max(0, remaining % 60);
+      return i.reply({ content:`⏳ Tu dois attendre **${min} min ${sec}s** avant de relancer /ygo.`, ephemeral:true });
+    }
+    touchPull(user);
+
+    await i.deferReply();
+
+    const candidates = [];
+    for (let k=0;k<3;k++) candidates.push(await rollOneYGOCandidate(user));
+
+    const embeds = candidates.map((c, idx) => new EmbedBuilder()
+      .setTitle(`${c.rarity.badge} ${c.rarity.k} • ${c.char.name}`)
+      .setDescription(`**Série :** ${c.char.anime}\n**PV :** ${c.stats.hp}\n**Dégâts :** ${c.stats.dmg}\n\nChoisis avec les boutons ci-dessous.`)
+      .setColor(c.rarity.color)
+      .setFooter({ text: `Option ${idx+1}` })
+    );
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('choose_ygo_1').setLabel('1').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('choose_ygo_2').setLabel('2').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('choose_ygo_3').setLabel('3').setStyle(ButtonStyle.Primary),
+    );
+
+    const sent = await i.editReply({ embeds, components: [row] });
+
+    try {
+      const click = await sent.awaitMessageComponent({
+        filter: (btnInt) => btnInt.user.id === i.user.id && ['choose_ygo_1','choose_ygo_2','choose_ygo_3'].includes(btnInt.customId),
+        time: 60_000
+      });
+
+      const idx = Number(click.customId.split('_')[2]) - 1;
+      const chosen = candidates[idx];
+
+      const cardId = upsertCard(chosen.char.name, chosen.char.anime, chosen.char.image ?? '');
+      q.upsertOwnership.run(user.id, cardId);
+
+      updatePityCounters(user, chosen.rarity.k);
+      const statsDelta = { C:0, R:0, EP:0, LEG:0, MYTH:0 };
+      statsDelta[chosen.rarity.k] = 1;
+      q.incStats.run(statsDelta.C, statsDelta.R, statsDelta.EP, statsDelta.LEG, statsDelta.MYTH, user.id);
+      const pityFooter = `Pity LEG: ${user.pity_leg}/${PITY_LEG_THRESHOLD} • Pity MYTH: ${user.pity_myth}/${PITY_MYTH_THRESHOLD}`;
+
+      const result = new EmbedBuilder()
+        .setTitle(`✅ Tu as choisi: ${chosen.rarity.badge} ${chosen.rarity.k} • ${chosen.char.name}`)
+        .setDescription(`**Série :** ${chosen.char.anime}\n**PV :** ${chosen.stats.hp}\n**Dégâts :** ${chosen.stats.dmg}`)
+        .setColor(chosen.rarity.color)
+        .setFooter({ text: pityFooter });
+
+      const disabled = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('choose_ygo_1').setLabel('1').setStyle(ButtonStyle.Primary).setDisabled(true),
+        new ButtonBuilder().setCustomId('choose_ygo_2').setLabel('2').setStyle(ButtonStyle.Primary).setDisabled(true),
+        new ButtonBuilder().setCustomId('choose_ygo_3').setLabel('3').setStyle(ButtonStyle.Primary).setDisabled(true),
+      );
+
+      await click.update({ embeds: [result], components: [disabled] });
+
+    } catch {
+      const disabled = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('choose_ygo_1').setLabel('1').setStyle(ButtonStyle.Secondary).setDisabled(true),
+        new ButtonBuilder().setCustomId('choose_ygo_2').setLabel('2').setStyle(ButtonStyle.Secondary).setDisabled(true),
+        new ButtonBuilder().setCustomId('choose_ygo_3').setLabel('3').setStyle(ButtonStyle.Secondary).setDisabled(true),
+      );
+      await i.editReply({ content: '⏰ Temps écoulé. Relance `/ygo` pour recommencer.', components: [disabled] });
+    }
+  }
+
+  // /pokemon : 3 Pokémon (normal / Mega / EX) avec stats
+  else if (i.commandName === 'pokemon') {
+    const user = getOrCreateUser(i.member);
+    if (!canPull(user)) {
+      const remaining = Math.ceil(COOLDOWN_SECONDS - (Date.now()/1000 - user.last_pull_ts));
+      const min = Math.max(0, Math.floor(remaining/60));
+      const sec = Math.max(0, remaining % 60);
+      return i.reply({ content:`⏳ Tu dois attendre **${min} min ${sec}s** avant de relancer /pokemon.`, ephemeral:true });
+    }
+    touchPull(user);
+
+    await i.deferReply();
+
+    const candidates = [];
+    for (let k=0;k<3;k++) candidates.push(await rollOnePokemonCandidate(user));
+
+    const embeds = candidates.map((c, idx) => {
+      const typeBadge = c.meta.type === 'mega' ? '🌀 Mega' : (c.meta.type === 'ex' ? '✨ EX' : '⬜ Normal');
+      return new EmbedBuilder()
+        .setTitle(`${c.rarity.badge} ${c.rarity.k} • ${c.char.name}`)
+        .setDescription(`**Série :** ${c.char.anime} • **Forme :** ${typeBadge}\n**PV :** ${c.stats.hp}\n**Dégâts :** ${c.stats.dmg}\n\nChoisis avec les boutons ci-dessous.`)
+        .setColor(c.rarity.color)
+        .setFooter({ text: `Option ${idx+1}` });
+    });
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setCustomId('choose_pkm_1').setLabel('1').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('choose_pkm_2').setLabel('2').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('choose_pkm_3').setLabel('3').setStyle(ButtonStyle.Primary),
+    );
+
+    const sent = await i.editReply({ embeds, components: [row] });
+
+    try {
+      const click = await sent.awaitMessageComponent({
+        filter: (btnInt) => btnInt.user.id === i.user.id && ['choose_pkm_1','choose_pkm_2','choose_pkm_3'].includes(btnInt.customId),
+        time: 60_000
+      });
+
+      const idx = Number(click.customId.split('_')[2]) - 1;
+      const chosen = candidates[idx];
+
+      const cardId = upsertCard(chosen.char.name, chosen.char.anime, chosen.char.image ?? '');
+      q.upsertOwnership.run(user.id, cardId);
+
+      updatePityCounters(user, chosen.rarity.k);
+      const statsDelta = { C:0, R:0, EP:0, LEG:0, MYTH:0 };
+      statsDelta[chosen.rarity.k] = 1;
+      q.incStats.run(statsDelta.C, statsDelta.R, statsDelta.EP, statsDelta.LEG, statsDelta.MYTH, user.id);
+      const pityFooter = `Pity LEG: ${user.pity_leg}/${PITY_LEG_THRESHOLD} • Pity MYTH: ${user.pity_myth}/${PITY_MYTH_THRESHOLD}`;
+
+      const typeBadge = chosen.meta.type === 'mega' ? '🌀 Mega' : (chosen.meta.type === 'ex' ? '✨ EX' : '⬜ Normal');
+      const result = new EmbedBuilder()
+        .setTitle(`✅ Tu as choisi: ${chosen.rarity.badge} ${chosen.rarity.k} • ${chosen.char.name}`)
+        .setDescription(`**Série :** ${chosen.char.anime} • **Forme :** ${typeBadge}\n**PV :** ${chosen.stats.hp}\n**Dégâts :** ${chosen.stats.dmg}`)
+        .setColor(chosen.rarity.color)
+        .setFooter({ text: pityFooter });
+
+      const disabled = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('choose_pkm_1').setLabel('1').setStyle(ButtonStyle.Primary).setDisabled(true),
+        new ButtonBuilder().setCustomId('choose_pkm_2').setLabel('2').setStyle(ButtonStyle.Primary).setDisabled(true),
+        new ButtonBuilder().setCustomId('choose_pkm_3').setLabel('3').setStyle(ButtonStyle.Primary).setDisabled(true),
+      );
+
+      await click.update({ embeds: [result], components: [disabled] });
+
+    } catch {
+      const disabled = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('choose_pkm_1').setLabel('1').setStyle(ButtonStyle.Secondary).setDisabled(true),
+        new ButtonBuilder().setCustomId('choose_pkm_2').setLabel('2').setStyle(ButtonStyle.Secondary).setDisabled(true),
+        new ButtonBuilder().setCustomId('choose_pkm_3').setLabel('3').setStyle(ButtonStyle.Secondary).setDisabled(true),
+      );
+      await i.editReply({ content: '⏰ Temps écoulé. Relance `/pokemon` pour recommencer.', components: [disabled] });
     }
   }
 
@@ -384,7 +644,7 @@ client.on('interactionCreate', async (i) => {
     const member = await i.guild.members.fetch(target.id).catch(()=>null);
     const u = getOrCreateUser(member ?? { id: target.id, displayName: target.username });
 
-    if (u.pulls === 0) return i.reply({ content:'Aucune statistique pour le moment. Lance `/draft` !', ephemeral:true });
+    if (u.pulls === 0) return i.reply({ content:'Aucune statistique pour le moment. Lance `/draft`, `/ygo` ou `/pokemon` !', ephemeral:true });
     const emb = new EmbedBuilder()
       .setTitle(`📊 Stats de ${member?.displayName ?? target.username}`)
       .addFields(
@@ -408,7 +668,6 @@ client.on('interactionCreate', async (i) => {
     if (own.qty < 3) return i.reply({ content:`❌ Il faut **3 doublons** pour fusionner. Tu en as ${own.qty}.`, ephemeral:true });
     if (own.stars >= 5) return i.reply({ content:`⭐ Carte déjà au **max (5⭐)**.`, ephemeral:true });
 
-    // consomme 3 unités → -2 qty, +1 star
     q.updateOwnership.run(own.qty - 2, own.stars + 1, own.user_id, own.card_id);
     const emb = new EmbedBuilder()
       .setTitle(`✨ Fusion réussie : ${cardName}`)
@@ -524,7 +783,7 @@ client.on('interactionCreate', async (i) => {
     }
   }
 
-  // ADMIN (si tu as ajouté /admin dans deploy-commands.js)
+  // ADMIN
   else if (i.commandName === 'admin') {
     const sub = i.options.getSubcommand();
     const ADMIN_ID = process.env.ADMIN_ID;

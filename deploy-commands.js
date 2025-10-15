@@ -1,12 +1,19 @@
-// deploy-commands.js (draft-only)
+// deploy-commands.js (draft + /ygo + /pokemon, guild mode)
 import 'dotenv/config';
 import { REST, Routes, SlashCommandBuilder } from 'discord.js';
 
 const commands = [
-  // DRAFT replaces PULL
   new SlashCommandBuilder()
     .setName('draft')
-    .setDescription('Tirage 3 cartes, choisis-en 1'),
+    .setDescription('Tirage 3 cartes anime, choisis-en 1'),
+
+  new SlashCommandBuilder()
+    .setName('ygo')
+    .setDescription('Tirage 3 monstres Yu-Gi-Oh!, choisis-en 1'),
+
+  new SlashCommandBuilder()
+    .setName('pokemon')
+    .setDescription('Tirage 3 Pokémon (Normal/Mega/EX), choisis-en 1'),
 
   new SlashCommandBuilder()
     .setName('inventory')
@@ -67,4 +74,4 @@ await rest.put(
   { body: commands }
 );
 
-console.log('✅ Slash commands déployées (mode guild, draft-only).');
+console.log('✅ Slash commands déployées (guild, draft + ygo + pokemon).');
