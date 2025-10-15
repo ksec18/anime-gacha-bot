@@ -3,7 +3,13 @@ import 'dotenv/config';
 import { Client, GatewayIntentBits, EmbedBuilder, Colors, PermissionFlagsBits, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
 import Database from 'better-sqlite3';
 import { request } from 'undici';
-import { InteractionResponseFlags } from 'discord.js';
+import { InteractionResponseFlags } from 'discord.js';// ESM compatible avec un module CommonJS
+import pkg from 'discord.js';
+const { InteractionResponseFlags, MessageFlags } = pkg;
+
+// Sélecteur sûr : marche avec v15 (InteractionResponseFlags) et v14 (MessageFlags)
+const EPHEMERAL_FLAG = (InteractionResponseFlags?.Ephemeral) ?? (MessageFlags?.Ephemeral);
+
 
 
 /* =========================
@@ -790,7 +796,7 @@ client.on('interactionCreate', async (i) => {
     const sub = i.options.getSubcommand();
     const ADMIN_ID = process.env.ADMIN_ID;
     if (i.user.id !== ADMIN_ID)
-      return i.reply({ content: '❌ Tu n’as pas les droits admin.', ephemeral: true });
+      return i.reply({ content: '❌ Tu n’as pas les droits admin.', flags: EPHEMERAL_FLAG });
 
     if (sub === 'reset-db') {
       db.exec(`
@@ -826,7 +832,7 @@ client.on('interactionCreate', async (i) => {
       const member = await i.guild.members.fetch(target.id).catch(() => null);
       const u = getOrCreateUser(member ?? { id: target.id, displayName: target.username });
       const card = q.getCard.get(cardName, '') || q.getCard.get(cardName, 'Unknown');
-      if (!card) return i.reply({ content: `❌ Carte inconnue (${cardName}).`, ephemeral: true });
+      if (!card) return i.reply({ content: `❌ Carte inconnue (${cardName}).`, flags: EPHEMERAL_FLAG });
       q.upsertOwnership.run(u.id, card.id);
       q.updateOwnership.run(qty, 1, u.id, card.id);
       return i.reply({ content: `🎁 Donné **${qty}× ${cardName}** à **${target.username}**.` });
