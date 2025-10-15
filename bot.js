@@ -3,7 +3,6 @@ import 'dotenv/config';
 import { Client, GatewayIntentBits, EmbedBuilder, Colors, PermissionFlagsBits, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
 import Database from 'better-sqlite3';
 import { request } from 'undici';
-import { InteractionResponseFlags } from 'discord.js';// ESM compatible avec un module CommonJS
 import pkg from 'discord.js';
 const { InteractionResponseFlags, MessageFlags } = pkg;
 
