@@ -371,7 +371,7 @@ return { rarity, char: { name: displayName, anime: 'Pokémon', image: img }, sta
 /* =========================
    READY
 ========================= */
-client.once('ready', () => {
+client.once('clientReady', () => {
   console.log(`✅ Connecté en tant que ${client.user.tag}`);
 });
 
