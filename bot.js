@@ -1,15 +1,8 @@
-// bot.js (draft + /ygo + /pokemon, 15 min cooldown)
+// bot.js — patched: AniList retry + local fallback for /draft (and keeps /ygo + /pokemon), 15 min cooldown
 import 'dotenv/config';
 import { Client, GatewayIntentBits, EmbedBuilder, Colors, PermissionFlagsBits, ActionRowBuilder, ButtonBuilder, ButtonStyle } from 'discord.js';
 import Database from 'better-sqlite3';
-import { request } from 'undici';
-import pkg from 'discord.js';
-const { InteractionResponseFlags, MessageFlags } = pkg;
-
-// Sélecteur sûr : marche avec v15 (InteractionResponseFlags) et v14 (MessageFlags)
-const EPHEMERAL_FLAG = (InteractionResponseFlags?.Ephemeral) ?? (MessageFlags?.Ephemeral);
-
-
+import { fetch } from 'undici';
 
 /* =========================
    CONFIG
@@ -29,17 +22,47 @@ const RARITIES = [
 const PITY_LEG_THRESHOLD  = 30;   // garanti LEG au plus tard
 const PITY_MYTH_THRESHOLD = 100;  // garanti MYTH au plus tard
 
+/* =========================
+   HTTP helper with retry
+========================= */
+async function httpJson(url, opts = {}, tries = 3) {
+  let lastErr;
+  for (let a = 0; a < tries; a++) {
+    try {
+      const res = await fetch(url, {
+        ...opts,
+        headers: { 'content-type': 'application/json', 'user-agent': 'anime-gacha-bot/1.0', ...(opts.headers||{}) },
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch (e) {
+      lastErr = e;
+      await new Promise(r => setTimeout(r, 400 * (a + 1)));
+    }
+  }
+  throw lastErr;
+}
+
 const ANILIST_URL = 'https://graphql.anilist.co';
 const ANILIST_QUERY = `
 query ($page: Int, $perPage: Int) {
-  Page(page: $$page, perPage: $$perPage) {
+  Page(page: $page, perPage: $perPage) {
     characters(sort: FAVOURITES_DESC) {
       name { full }
       image { large }
       media(perPage: 1) { nodes { title { romaji english native } } }
     }
   }
-}`.replaceAll('$$','');
+}`;
+
+/* Petit pool local de secours si AniList est KO */
+const LOCAL_FALLBACK = [
+  { name: 'Naruto Uzumaki', image: 'https://i.imgur.com/4ZtqgIG.jpeg', anime: 'Naruto' },
+  { name: 'Monkey D. Luffy', image: 'https://i.imgur.com/0qD8y2S.jpeg', anime: 'One Piece' },
+  { name: 'Goku', image: 'https://i.imgur.com/DqVv1nG.jpeg', anime: 'Dragon Ball' },
+  { name: 'Mikasa Ackerman', image: 'https://i.imgur.com/1b1n0iN.jpeg', anime: 'Attack on Titan' },
+  { name: 'Saitama', image: 'https://i.imgur.com/0p5QmKf.jpeg', anime: 'One Punch Man' },
+];
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
@@ -129,7 +152,7 @@ const q = {
     SELECT o.*, c.id AS card_id, c.name, c.anime FROM ownership o
     JOIN cards c ON c.id = o.card_id
     WHERE o.user_id=? AND c.name=?
-  `),
+ `),
   updateOwnership: db.prepare('UPDATE ownership SET qty=?, stars=? WHERE user_id=? AND card_id=?'),
   deleteOwnershipZero: db.prepare('DELETE FROM ownership WHERE qty<=0'),
 
@@ -189,17 +212,29 @@ function updatePityCounters(user, rarityKey) {
   user.pity_leg = pity_leg; user.pity_myth = pity_myth;
 }
 
+/* ===== AniList fetch with retries + fallback ===== */
 async function fetchRandomCharacter(pages) {
-  const page = Math.floor(Math.random()*(pages[1]-pages[0]+1))+pages[0];
-  const body = { query: ANILIST_QUERY, variables: { page, perPage: 50 } };
-  const res = await request(ANILIST_URL, { method:'POST', body: JSON.stringify(body), headers: { 'content-type':'application/json' }});
-  const data = await res.body.json();
-  const list = data?.data?.Page?.characters ?? [];
-  if (!list.length) return null;
-  const ch = list[Math.floor(Math.random()*list.length)];
-  const t = ch.media?.nodes?.[0]?.title ?? {};
-  const anime = t.romaji || t.english || t.native || 'Unknown';
-  return { name: ch.name.full, image: ch.image.large, anime };
+  for (let t = 0; t < 3; t++) {
+    const page = Math.floor(Math.random()*(pages[1]-pages[0]+1))+pages[0];
+    try {
+      const data = await httpJson(ANILIST_URL, {
+        method: 'POST',
+        body: JSON.stringify({ query: ANILIST_QUERY, variables: { page, perPage: 50 } }),
+      });
+      const list = data?.data?.Page?.characters ?? [];
+      if (list.length) {
+        const ch = list[Math.floor(Math.random()*(list.length))];
+        const tt = ch.media?.nodes?.[0]?.title ?? {};
+        const anime = tt.romaji || tt.english || tt.native || 'Unknown';
+        return { name: ch.name.full, image: ch.image.large, anime };
+      }
+    } catch {
+      // retry with another page
+    }
+  }
+  // fallback local
+  const pick = LOCAL_FALLBACK[Math.floor(Math.random()*LOCAL_FALLBACK.length)];
+  return { ...pick };
 }
 
 function upsertCard(name, anime, image) {
@@ -211,7 +246,7 @@ function upsertCard(name, anime, image) {
 
 function snowflake() { return String(Date.now()) + Math.floor(Math.random()*1e6); }
 
-/* ===== Draft helpers (anime all) ===== */
+// ==== Draft helpers (anime all) ====
 async function rollOneCandidate(user, banner) {
   const rarity = rollRarityWithPity(user);
   let char = null;
@@ -229,6 +264,16 @@ async function rollOneCandidate(user, banner) {
   } while (attempts < 4);
 
   return char ? { rarity, char } : null;
+}
+
+// Ensure 3 candidates even if AniList is down
+function fillWithFallback(candidates, user) {
+  while (candidates.length < 3) {
+    const rarity = rollRarityWithPity(user);
+    const fb = LOCAL_FALLBACK[Math.floor(Math.random()*LOCAL_FALLBACK.length)];
+    candidates.push({ rarity, char: fb });
+  }
+  return candidates;
 }
 
 /* ===== Yu-Gi-Oh! pool & rules ===== */
@@ -257,42 +302,6 @@ async function rollOneYGOCandidate(user) {
 }
 
 /* ===== Pokémon pool & rules ===== */
-// type: 'normal' | 'mega' | 'ex'
-// === Pokémon images (sprites officiels ou fanart) ===
-// Tu peux mettre les URL des images de ton choix (par ex. Imgur, PokéAPI, etc.)
-const POKEMON_IMAGES = {
-  'Pikachu': 'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/25.png',
-  'Charizard': 'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/6.png',
-  'Blastoise': 'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/9.png',
-  'Venusaur': 'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/3.png',
-  'Gengar': 'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/94.png',
-  'Lucario': 'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/448.png',
-  'Greninja': 'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/658.png',
-  'Dragonite': 'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/149.png',
-  'Tyranitar': 'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/248.png',
-  'Gardevoir': 'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/282.png',
-
-  // Méga-évolutions (ici exemples custom, car PokéAPI n’a pas de sprites Mega)
-  'Mega Charizard X': 'https://archives.bulbagarden.net/media/upload/0/05/006Charizard-Mega_X.png',
-  'Mega Charizard Y': 'https://archives.bulbagarden.net/media/upload/9/95/006Charizard-Mega_Y.png',
-  'Mega Blastoise': 'https://archives.bulbagarden.net/media/upload/0/02/009Blastoise-Mega.png',
-  'Mega Venusaur': 'https://archives.bulbagarden.net/media/upload/3/3d/003Venusaur-Mega.png',
-  'Mega Gengar': 'https://archives.bulbagarden.net/media/upload/e/e5/094Gengar-Mega.png',
-  'Mega Lucario': 'https://archives.bulbagarden.net/media/upload/4/41/448Lucario-Mega.png',
-  'Mega Gardevoir': 'https://archives.bulbagarden.net/media/upload/8/87/282Gardevoir-Mega.png',
-  'Mega Salamence': 'https://archives.bulbagarden.net/media/upload/0/0a/373Salamence-Mega.png',
-  'Mega Metagross': 'https://archives.bulbagarden.net/media/upload/5/5f/376Metagross-Mega.png',
-  'Mega Rayquaza': 'https://archives.bulbagarden.net/media/upload/8/8e/384Rayquaza-Mega.png',
-
-  // EX (cartes TCG — exemples)
-  'Mewtwo EX': 'https://images.pokemontcg.io/bw3/54_hires.png',
-  'Rayquaza EX': 'https://images.pokemontcg.io/xy6/60_hires.png',
-  'Groudon EX': 'https://images.pokemontcg.io/xy5/85_hires.png',
-  'Kyogre EX': 'https://images.pokemontcg.io/xy5/26_hires.png',
-  'Garchomp EX': 'https://images.pokemontcg.io/bw8/45_hires.png',
-  'Charizard EX': 'https://images.pokemontcg.io/xy2/12_hires.png'
-};
-
 const POKEMON_POOL = [
   { name: 'Pikachu', type: 'normal' },
   { name: 'Charizard', type: 'normal' },
@@ -305,7 +314,7 @@ const POKEMON_POOL = [
   { name: 'Tyranitar', type: 'normal' },
   { name: 'Gardevoir', type: 'normal' },
 
-  // Mega evolutions
+  // Mega
   { name: 'Mega Charizard X', type: 'mega' },
   { name: 'Mega Charizard Y', type: 'mega' },
   { name: 'Mega Blastoise', type: 'mega' },
@@ -317,7 +326,7 @@ const POKEMON_POOL = [
   { name: 'Mega Metagross', type: 'mega' },
   { name: 'Mega Rayquaza', type: 'mega' },
 
-  // EX (cartes type TCG style)
+  // EX
   { name: 'Mewtwo EX', type: 'ex' },
   { name: 'Rayquaza EX', type: 'ex' },
   { name: 'Groudon EX', type: 'ex' },
@@ -325,8 +334,6 @@ const POKEMON_POOL = [
   { name: 'Garchomp EX', type: 'ex' },
   { name: 'Charizard EX', type: 'ex' },
 ];
-
-// Règles de stats par rareté, ajustées pour Pokémon
 const PKM_STAT_RULES = {
   C:   { hp:[50,80],   dmg:[10,40] },
   R:   { hp:[80,120],  dmg:[40,80] },
@@ -334,8 +341,6 @@ const PKM_STAT_RULES = {
   LEG: { hp:[180,230], dmg:[130,180] },
   MYTH:{ hp:[230,300], dmg:[180,240] }
 };
-
-// Pondération des types par rareté (pour sortir des mega/ex surtout en hautes raretés)
 const TYPE_WEIGHT_BY_RARITY = {
   C:   { normal: 1.0, mega: 0.0, ex: 0.0 },
   R:   { normal: 0.95, mega: 0.04, ex: 0.01 },
@@ -343,7 +348,6 @@ const TYPE_WEIGHT_BY_RARITY = {
   LEG: { normal: 0.40, mega: 0.40, ex: 0.20 },
   MYTH:{ normal: 0.10, mega: 0.55, ex: 0.35 }
 };
-
 function weightedPick(weights) {
   const x = Math.random();
   let acc = 0;
@@ -351,10 +355,8 @@ function weightedPick(weights) {
     acc += w;
     if (x <= acc) return k;
   }
-  // fallback
   return Object.keys(weights)[0];
 }
-
 async function rollOnePokemonCandidate(user) {
   const rarity = rollRarityWithPity(user);
   const type = weightedPick(TYPE_WEIGHT_BY_RARITY[rarity.k]);
@@ -364,14 +366,13 @@ async function rollOnePokemonCandidate(user) {
   const hp = randInt(rules.hp[0], rules.hp[1]);
   const dmg = randInt(rules.dmg[0], rules.dmg[1]);
   const displayName = pick.name;
-const img = POKEMON_IMAGES[displayName] ?? null;
-return { rarity, char: { name: displayName, anime: 'Pokémon', image: img }, stats: { hp, dmg }, meta: { type } };
+  return { rarity, char: { name: displayName, anime: 'Pokémon', image: null }, stats: { hp, dmg }, meta: { type } };
 }
 
 /* =========================
    READY
 ========================= */
-client.once('clientReady', () => {
+client.once('ready', () => {
   console.log(`✅ Connecté en tant que ${client.user.tag}`);
 });
 
@@ -397,7 +398,7 @@ client.on('interactionCreate', async (i) => {
 client.on('interactionCreate', async (i) => {
   if (!i.isChatInputCommand()) return;
 
-  // /draft : 3 cartes anime, choisir 1
+  // /draft : 3 cartes anime, choisir 1 (toujours 3 grâce au fallback)
   if (i.commandName === 'draft') {
     const user = getOrCreateUser(i.member);
     if (!canPull(user)) {
@@ -418,15 +419,16 @@ client.on('interactionCreate', async (i) => {
       const cand = await rollOneCandidate(user, banner);
       if (cand) candidates.push(cand);
     }
-    if (candidates.length < 3) return i.editReply({ content: '❌ Impossible de générer 3 cartes (AniList indisponible). Réessaie.' });
+    // Assure 3 choix (fallback local si nécessaire)
+    fillWithFallback(candidates, user);
 
     const embeds = candidates.map((c, idx) => {
       const emb = new EmbedBuilder()
         .setTitle(`${c.rarity.badge} ${c.rarity.k} • ${c.char.name}`)
         .setDescription(`**Anime :** ${c.char.anime}\nChoisis avec les boutons ci-dessous.`)
-        .setImage(c.char.image)
         .setColor(c.rarity.color)
-        .setFooter({ text: `Option ${idx+1}` });
+        .setFooter({ text: `Option ${idx+1}${LOCAL_FALLBACK.find(f=>f.name===c.char.name)?' • fallback':''}` });
+      if (c.char.image) emb.setImage(c.char.image);
       if (banner) emb.setAuthor({ name: `Bannière: ${banner.name} (+${banner.bonus_percent}% focus)` });
       return emb;
     });
@@ -448,7 +450,7 @@ client.on('interactionCreate', async (i) => {
       const idx = Number(click.customId.split('_')[1]) - 1;
       const chosen = candidates[idx];
 
-      const cardId = upsertCard(chosen.char.name, chosen.char.anime, chosen.char.image);
+      const cardId = upsertCard(chosen.char.name, chosen.char.anime, chosen.char.image ?? '');
       q.upsertOwnership.run(user.id, cardId);
 
       updatePityCounters(user, chosen.rarity.k);
@@ -460,9 +462,9 @@ client.on('interactionCreate', async (i) => {
       const result = new EmbedBuilder()
         .setTitle(`✅ Tu as choisi: ${chosen.rarity.badge} ${chosen.rarity.k} • ${chosen.char.name}`)
         .setDescription(`**Anime :** ${chosen.char.anime}`)
-        .setImage(chosen.char.image)
         .setColor(chosen.rarity.color)
         .setFooter({ text: pityFooter });
+      if (chosen.char.image) result.setImage(chosen.char.image);
 
       const disabled = new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('choose_1').setLabel('1').setStyle(ButtonStyle.Primary).setDisabled(true),
@@ -795,7 +797,7 @@ client.on('interactionCreate', async (i) => {
     const sub = i.options.getSubcommand();
     const ADMIN_ID = process.env.ADMIN_ID;
     if (i.user.id !== ADMIN_ID)
-      return i.reply({ content: '❌ Tu n’as pas les droits admin.', flags: EPHEMERAL_FLAG });
+      return i.reply({ content: '❌ Tu n’as pas les droits admin.', ephemeral: true });
 
     if (sub === 'reset-db') {
       db.exec(`
@@ -831,7 +833,7 @@ client.on('interactionCreate', async (i) => {
       const member = await i.guild.members.fetch(target.id).catch(() => null);
       const u = getOrCreateUser(member ?? { id: target.id, displayName: target.username });
       const card = q.getCard.get(cardName, '') || q.getCard.get(cardName, 'Unknown');
-      if (!card) return i.reply({ content: `❌ Carte inconnue (${cardName}).`, flags: EPHEMERAL_FLAG });
+      if (!card) return i.reply({ content: `❌ Carte inconnue (${cardName}).`, ephemeral: true });
       q.upsertOwnership.run(u.id, card.id);
       q.updateOwnership.run(qty, 1, u.id, card.id);
       return i.reply({ content: `🎁 Donné **${qty}× ${cardName}** à **${target.username}**.` });
